@@ -7,9 +7,9 @@ enum LlmdbTools {
     static var all: [MCPTool] {
         [
             launch, attach, stop, sessions,
-            breakSet, breakList, breakDelete, breakException,
+            breakSet, breakFunction, breakList, breakDelete, breakException,
             continueExec, runUntil, interrupt, step, wait,
-            backtrace, locals, expand, scopes, threads, expr, output, setVar,
+            backtrace, locals, expand, scopes, threads, expr, output, setVar, lldb,
             doctor
         ]
     }
@@ -85,6 +85,26 @@ enum LlmdbTools {
         var condition: String?
         @InputProperty("Fire on a hit-count match, e.g. `>5` (every hit past 5) or `3` (the 3rd hit)")
         var hit_condition: String?
+    }
+
+    struct BreakFunctionToolArgs: MCPToolInput {
+        @InputProperty(
+            "Function name: Swift (`compute`, `Module.Type.method`), C, or a full Objective-C selector (`-[NSWindow makeFirstResponder:]`)"
+        )
+        var name: String
+        @InputProperty("Session ID (omit when only one is active)")
+        var session_id: String?
+        @InputProperty("Fire only when this expression is true in the target's language, e.g. `n > 100`")
+        var condition: String?
+        @InputProperty("Fire on a hit-count match, e.g. `>5` (every hit past 5) or `3` (the 3rd hit)")
+        var hit_condition: String?
+    }
+
+    struct LLDBCommandToolArgs: MCPToolInput {
+        @InputProperty("lldb command, e.g. `image lookup -n main`, `disassemble -n compute`, `register read`")
+        var command: String
+        @InputProperty("Session ID (omit when only one is active)")
+        var session_id: String?
     }
 
     struct StepToolArgs: MCPToolInput {
@@ -240,6 +260,21 @@ enum LlmdbTools {
         )
     }
 
+    static let breakFunction = MCPTool(
+        name: "llmdb_break_function",
+        description: "Set a breakpoint on a function by name — Swift, C, or an Objective-C selector like -[NSWindow makeFirstResponder:]. Resolved by symbol, so system frameworks without debug info work. Optional condition / hit_condition. verified=false means nothing matches yet (typo, or the module isn't loaded) — it resolves when a matching module loads. Remove with llmdb_break_delete."
+    ) { (args: BreakFunctionToolArgs) in
+        try await callJSON(
+            RPC.breakFunction,
+            BreakFunctionParams(
+                sessionId: args.session_id,
+                name: args.name,
+                condition: args.condition,
+                hitCondition: args.hit_condition
+            )
+        )
+    }
+
     static let continueExec = MCPTool(
         name: "llmdb_continue",
         description: "Resume execution. wait (seconds) blocks until next stop, default 60. wait=0 fires and returns immediately (state=running) — then call llmdb_wait or poll llmdb_sessions. Use wait=0 for interactive UI debugging where the next stop may take any amount of time."
@@ -360,6 +395,16 @@ enum LlmdbTools {
         try await callJSON(
             RPC.expr,
             ExprParams(sessionId: args.session_id, expression: args.expression, frame: args.frame)
+        )
+    }
+
+    static let lldb = MCPTool(
+        name: "llmdb_lldb",
+        description: "Run a raw lldb command and return its printed `output` (errors included). For what the other tools don't cover: image lookup, disassemble, memory read, register read, regex breakpoints (breakpoint set -r), command script import. Acts on lldb's selected frame — the top frame after a stop; `frame select N` moves it. Breakpoints set this way stop the target but aren't in llmdb_break_list — remove them with `breakpoint delete <id>`. Resume and pause with llmdb_continue / llmdb_step / llmdb_interrupt, not lldb's continue/step/process interrupt: those return before the state change is recorded, so a following llmdb_wait can report the previous stop."
+    ) { (args: LLDBCommandToolArgs) in
+        try await callJSON(
+            RPC.lldb,
+            LLDBCommandParams(sessionId: args.session_id, command: args.command)
         )
     }
 

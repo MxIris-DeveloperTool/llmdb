@@ -23,6 +23,10 @@ actor SessionManager {
         var stoppedThreadId: Int?
         var listener: Task<Void, Never>?
         var breakpoints: [Int: TrackedBreakpoint] = [:]
+        // Function breakpoints, kept apart from source ones because DAP
+        // replaces each kind as a whole: `setFunctionBreakpoints` takes every
+        // function breakpoint at once, the way `setBreakpoints` takes a file's.
+        var functionBreakpoints: [Int: TrackedFunctionBreakpoint] = [:]
         // Program output captured from DAP `output` events, oldest first.
         // Trimmed from the front once it exceeds `maxOutputChars`.
         var output: [OutputChunk] = []
@@ -71,6 +75,21 @@ actor SessionManager {
 
         var request: BPLine {
             BPLine(line: line, condition: breakpoint.condition, hitCondition: breakpoint.hitCondition)
+        }
+    }
+
+    /// A function breakpoint as requested (name exactly as sent) plus what
+    /// lldb-dap reported for it. The requested name is what gets resent.
+    private struct TrackedFunctionBreakpoint {
+        let name: String
+        var breakpoint: Breakpoint
+
+        var request: FunctionBreakpointRequest {
+            FunctionBreakpointRequest(
+                name: name,
+                condition: breakpoint.condition,
+                hitCondition: breakpoint.hitCondition
+            )
         }
     }
 
@@ -240,6 +259,75 @@ actor SessionManager {
             )
             if let id = info.id {
                 entry.breakpoints[id] = TrackedBreakpoint(file: file, line: requested.line, breakpoint: breakpoint)
+            }
+            return breakpoint
+        }
+    }
+
+    /// Set a breakpoint on every function matching `name`: a Swift name
+    /// (`compute`, `Module.Type.method`), a C function, or a full Objective-C
+    /// selector (`-[NSWindow makeFirstResponder:]`). lldb resolves it by
+    /// symbol, so system frameworks without debug info work too.
+    func setFunctionBreakpoint(
+        sessionId: String?,
+        name: String,
+        condition: String? = nil,
+        hitCondition: String? = nil
+    ) async throws -> (SessionSnapshot, Breakpoint) {
+        let entry = try resolve(sessionId)
+        guard !name.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw LlmdbError.invalidArgument(name: "name", value: name, valid: ["a function name"])
+        }
+        // Keep the other function breakpoints; one already on this name is
+        // replaced (so its condition updates) rather than duplicated.
+        var requests = trackedFunctionBreakpoints(entry).filter { $0.name != name }.map(\.request)
+        requests.append(FunctionBreakpointRequest(name: name, condition: condition, hitCondition: hitCondition))
+        let synced = try await syncFunctionBreakpoints(entry, requests: requests)
+        guard let breakpoint = synced.last else {
+            throw LlmdbError.dapFailure("setFunctionBreakpoints returned no breakpoint")
+        }
+        return (snapshot(entry), breakpoint)
+    }
+
+    /// The tracked function breakpoints, oldest first.
+    private func trackedFunctionBreakpoints(_ entry: SessionEntry) -> [TrackedFunctionBreakpoint] {
+        entry.functionBreakpoints.values.sorted { $0.breakpoint.id < $1.breakpoint.id }
+    }
+
+    /// Make `requests` the complete set of function breakpoints. Like
+    /// `setBreakpoints` for a file, `setFunctionBreakpoints` replaces every
+    /// function breakpoint, so sending only a new one would delete the others.
+    /// lldb-dap keeps the id of a name it already has. Returns the breakpoints
+    /// in request order.
+    private func syncFunctionBreakpoints(
+        _ entry: SessionEntry,
+        requests: [FunctionBreakpointRequest]
+    ) async throws -> [Breakpoint] {
+        let response = try await entry.client.request(
+            "setFunctionBreakpoints",
+            arguments: SetFunctionBreakpointsArgs(breakpoints: requests)
+        )
+        let reported = try response.decodeBody(SetBreakpointsBody.self).breakpoints
+        entry.functionBreakpoints.removeAll()
+        // lldb-dap doesn't echo name/condition/hitCondition, so they come
+        // from the request.
+        return zip(requests, reported).map { requested, information in
+            let breakpoint = Breakpoint(
+                id: information.id ?? 0,
+                verified: information.verified,
+                line: information.line,
+                source: information.source?.path,
+                message: information.message
+                    ?? (information.verified ? nil : Self.unresolvedFunctionBreakpointMessage),
+                condition: requested.condition,
+                hitCondition: requested.hitCondition,
+                function: requested.name
+            )
+            if let identifier = information.id {
+                entry.functionBreakpoints[identifier] = TrackedFunctionBreakpoint(
+                    name: requested.name,
+                    breakpoint: breakpoint
+                )
             }
             return breakpoint
         }
@@ -469,23 +557,70 @@ actor SessionManager {
     /// All breakpoints currently tracked for the session, sorted by id.
     func listBreakpoints(sessionId: String?) throws -> [Breakpoint] {
         let entry = try resolve(sessionId)
-        return entry.breakpoints.values.map(\.breakpoint).sorted { $0.id < $1.id }
+        return allBreakpoints(entry)
     }
 
-    /// Delete a breakpoint by id. DAP has no per-id delete, so the file's
-    /// remaining breakpoints are resent without it.
+    /// Source and function breakpoints together, sorted by id.
+    private func allBreakpoints(_ entry: SessionEntry) -> [Breakpoint] {
+        let sourceBreakpoints = entry.breakpoints.values.map(\.breakpoint)
+        let functionBreakpoints = entry.functionBreakpoints.values.map(\.breakpoint)
+        return (sourceBreakpoints + functionBreakpoints).sorted { $0.id < $1.id }
+    }
+
+    /// Delete a breakpoint by id. DAP has no per-id delete, so the rest of its
+    /// set — the file's breakpoints, or all function breakpoints — is resent
+    /// without it.
     func deleteBreakpoint(sessionId: String?, id: Int) async throws -> [Breakpoint] {
         let entry = try resolve(sessionId)
+        if entry.functionBreakpoints[id] != nil {
+            let remaining = trackedFunctionBreakpoints(entry).filter { $0.breakpoint.id != id }
+            _ = try await syncFunctionBreakpoints(entry, requests: remaining.map(\.request))
+            return allBreakpoints(entry)
+        }
         guard let doomed = entry.breakpoints[id] else {
             throw LlmdbError.invalidArgument(
                 name: "id",
                 value: "\(id)",
-                valid: entry.breakpoints.keys.sorted().map { String($0) }
+                valid: allBreakpoints(entry).map { String($0.id) }
             )
         }
         let remaining = trackedBreakpoints(entry, in: doomed.file).filter { $0.breakpoint.id != id }
         _ = try await syncBreakpoints(entry, file: doomed.file, lines: remaining.map(\.request))
-        return entry.breakpoints.values.map(\.breakpoint).sorted { $0.id < $1.id }
+        return allBreakpoints(entry)
+    }
+
+    /// Run a raw lldb command — `image lookup`, `disassemble`, `memory read`,
+    /// `breakpoint set -r`, `command script import`, … — and return what lldb
+    /// printed. lldb-dap doesn't flag a failed command, so errors come back as
+    /// output text too.
+    ///
+    /// Commands act on lldb's selected thread and frame, as at an lldb prompt:
+    /// after a stop that is the stopped thread's top frame, and `frame select`
+    /// moves it. lldb-dap ignores an evaluate request's frame for commands, so
+    /// none is sent.
+    ///
+    /// Commands that resume or pause the target (`continue`, `thread
+    /// step-over`, `process interrupt`) bypass the stop tracking the execution
+    /// verbs do: the command returns before lldb-dap reports the state change,
+    /// so a `wait` right after can still see the previous stop. Callers resume
+    /// with `continue`/`step`/`interrupt` instead; stops at breakpoints set
+    /// here are recorded like any other.
+    func runLLDBCommand(sessionId: String?, command: String) async throws -> String {
+        let entry = try resolve(sessionId)
+        let trimmedCommand = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An empty repl input makes lldb-dap repeat the previous command.
+        guard !trimmedCommand.isEmpty else {
+            throw LlmdbError.invalidArgument(name: "command", value: command, valid: ["an lldb command"])
+        }
+        let response = try await entry.client.request(
+            "evaluate",
+            arguments: EvaluateArgs(
+                expression: Self.commandEscapePrefix + trimmedCommand,
+                frameId: nil,
+                context: "repl"
+            )
+        )
+        return try response.decodeBody(EvaluateBody.self).result
     }
 
     func backtrace(
@@ -831,19 +966,14 @@ actor SessionManager {
             // Only breakpoints we set are tracked; an update for an id we
             // haven't recorded yet is covered by the setBreakpoints reply.
             if let body = try? event.decodeBody(BreakpointEventBody.self),
-               let bid = body.breakpoint.id,
-               var tracked = entry.breakpoints[bid] {
-                let existing = tracked.breakpoint
-                tracked.breakpoint = Breakpoint(
-                    id: bid,
-                    verified: body.breakpoint.verified,
-                    line: body.breakpoint.line ?? existing.line,
-                    source: body.breakpoint.source?.path ?? existing.source,
-                    message: body.breakpoint.message ?? (body.breakpoint.verified ? nil : existing.message),
-                    condition: existing.condition,
-                    hitCondition: existing.hitCondition
-                )
-                entry.breakpoints[bid] = tracked
+               let bid = body.breakpoint.id {
+                if var tracked = entry.breakpoints[bid] {
+                    tracked.breakpoint = tracked.breakpoint.updated(with: body.breakpoint)
+                    entry.breakpoints[bid] = tracked
+                } else if var tracked = entry.functionBreakpoints[bid] {
+                    tracked.breakpoint = tracked.breakpoint.updated(with: body.breakpoint)
+                    entry.functionBreakpoints[bid] = tracked
+                }
             }
         default:
             break
@@ -866,9 +996,36 @@ actor SessionManager {
     private static let unverifiedBreakpointMessage =
         "verification deferred until module loads — common for breakpoints set before launch or in lazily-loaded modules"
 
+    private static let unresolvedFunctionBreakpointMessage =
+        "no function matches this name yet — check the spelling; it resolves on its own if a module that defines it loads later"
+
+    /// lldb-dap's default `commandEscapePrefix`. In the "repl" context an
+    /// expression starting with it always runs as an lldb command, whatever
+    /// lldb-dap's command-or-expression guess would have been.
+    private static let commandEscapePrefix = "`"
+
     private static func makeID() -> String {
         let alphabet = Array("abcdefghjkmnpqrstuvwxyz23456789")
         return String((0..<6).map { _ in alphabet.randomElement()! })
+    }
+}
+
+private extension Breakpoint {
+    /// This breakpoint with a `breakpoint` event's update applied. Events
+    /// typically flip `verified` as modules load and may omit source/line, so
+    /// missing fields keep their current values; what lldb-dap never echoes
+    /// (condition, hitCondition, function) is always kept.
+    func updated(with update: DAPBreakpointInfo) -> Breakpoint {
+        Breakpoint(
+            id: id,
+            verified: update.verified,
+            line: update.line ?? line,
+            source: update.source?.path ?? source,
+            message: update.message ?? (update.verified ? nil : message),
+            condition: condition,
+            hitCondition: hitCondition,
+            function: function
+        )
     }
 }
 

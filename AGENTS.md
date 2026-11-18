@@ -16,7 +16,7 @@ llmdb/
 │   │   ├── Core/              # DAPClient, SessionManager, Daemon, DaemonClient, SimulatorResolver, AppBundleLauncher, ProcessRunner, DAP/RPC wire types
 │   │   ├── Models/            # Session, StopReason, Frame, Breakpoint, Thread, …
 │   │   ├── MCP/LlmdbTools.swift  # MCP tools, 1:1 with CLI
-│   │   └── Utilities/         # JSONOutput, error types, WaitSpec, SourceLocation
+│   │   └── Utilities/         # JSONOutput, error types, WaitSpec, SourceLocation, PassthroughText
 │   ├── Fixture/main.swift     # llmdb-fixture — see Fixture below
 │   └── ThrowFixture/main.swift # llmdb-throw-fixture — throws a Swift error (exception-BP tests)
 └── Tests/llmdbTests/
@@ -43,6 +43,7 @@ Deps: `swift-argument-parser`, `swift-cli-mcp`, `swift-subprocess`.
 - **`DAPClient`** speaks DAP (Content-Length JSON over stdio) to one `lldb-dap` per session. Event fan-out lives here: each subscriber gets its own `AsyncStream` via `client.events()` / `client.waitForEvent(...)`. Do not re-introduce a single-consumer model — the listener and per-call waiters share the stream.
 - **Only the listener writes session state from DAP events** (`SessionManager.handleEvent`). A verb notes `entry.stateVersion` before sending and calls `awaitStop(after:)`, which returns once the listener has recorded a newer stop or exit. Never apply an awaited event yourself — two writers race and roll state back.
 - **`setBreakpoints` replaces a file's whole set** (DAP semantics). Always go through `syncBreakpoints`; sending one line deletes the file's other breakpoints.
+- **`setFunctionBreakpoints` replaces every function breakpoint at once**, the same way. Function breakpoints live in their own map (`functionBreakpoints`) and always go through `syncFunctionBreakpoints`; `break list` and `break delete` cover both maps. lldb-dap keeps the id of a name it already has, so re-setting a name updates it in place.
 - **`SessionManager`** orchestrates the DAP handshake, tracks the most recent stop, exposes the high-level verbs.
 - **`SimulatorResolver`** wraps `xcrun simctl` for `bundle-id → host PID`.
 - **`AppBundleLauncher`** routes `.app` paths through `NSWorkspace.openApplication` and attaches by PID instead of `exec`ing the inner binary directly. Without this, AppKit/AX-driven tools can't see the launched process.
@@ -56,6 +57,12 @@ All in `SessionManager`. Each one was hit by a real agent and still exists in up
 - **SIGSTOP reported as `exception`.** lldb-dap maps every signal stop to `exception` (`EventHelper.cpp`: "DAP lacks stopped reasons for signals") and doesn't track pause requests. So the launch/attach pause and `interrupt` all arrive as `reason: "exception"`, `description: "signal SIGSTOP"`. We relabel them `entry` / `attach` / `pause` via `expectedStopReason`. Real exceptions (e.g. `swift_throw`) are untouched.
 - **Void expressions fail with `unknown error`.** lldb flags "no result" as an error and lldb-dap's evaluate handler forwards it — the call did run. `evaluate` returns `{type: "void", value: ""}`. The error code isn't visible over DAP, hence the message match. Never retry: it would repeat side effects.
 - **ObjC in frames without debug info** (e.g. top frame right after attach) compiles as Objective-C++ with no framework declarations — same as in Xcode. On the first clang compile error (message contains `<user expression`; Swift errors say `<EXPR>`) we `@import Foundation` plus UIKit/AppKit if loaded, then retry once per session. Safe because a compile error means nothing ran.
+- **Raw commands go through `evaluate` in the `repl` context.** The `lldb` verb prefixes the command with lldb-dap's default `commandEscapePrefix` (`` ` ``) so lldb-dap never guesses "expression or command". lldb-dap runs repl commands on lldb's selected thread and frame and uses the request's `frameId` only to pick a focus thread, so no frame is sent and there is no `--frame`: `frame select N` is the way to move. It doesn't flag a failed command either — lldb's error is just the `result` text. An empty repl input repeats the previous command, hence the blank-command check.
+- **Raw resume/pause commands bypass stop tracking.** lldb's `continue`, `thread step-*`, and `process interrupt` return before lldb-dap emits `continued`/`stopped`, so a `wait` right after can return the previous stop. Documented rather than worked around: agents resume with the execution verbs. Stops at breakpoints set by raw commands are recorded normally — the listener handles every `stopped` event.
+
+## CLI parsing quirks
+
+- **A word that starts with `-` and contains an `h` prints help.** ArgumentParser splits `-[NSAppleEventManager dispatchRawAppleEvent:withRawReply:handlerRefCon:]` into a short-flag cluster and finds `-h` in it — even for `.captureForPassthrough` arguments. `break function` and `lldb` therefore accept a leading `--`, which `passthroughText` drops; their captured words are rejoined with single spaces and not re-quoted (re-quoting would corrupt raw input like `expression -- …`).
 
 ## Session setup and teardown
 

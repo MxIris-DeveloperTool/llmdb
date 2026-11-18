@@ -39,6 +39,19 @@ struct PathTests {
     }
 
     @Test
+    func passthroughTextDropsTerminatorAndRejoinsWords() {
+        // `--` shields a leading `-` from flag parsing; it isn't part of the text.
+        #expect(passthroughText(["--", "-[NSWindow makeFirstResponder:]"]) == "-[NSWindow makeFirstResponder:]")
+        #expect(passthroughText(["image", "lookup", "-n", "main"]) == "image lookup -n main")
+        #expect(passthroughText(["image lookup -n main"]) == "image lookup -n main")
+        // Only the leading terminator goes; a later `--` belongs to the text.
+        #expect(passthroughText(["expression", "--", "1 + 1"]) == "expression -- 1 + 1")
+        #expect(passthroughText([]) == nil)
+        #expect(passthroughText(["--"]) == nil)
+        #expect(passthroughText(["--", " "]) == nil)
+    }
+
+    @Test
     func absolutePathResolvesRelativeAgainstCwd() {
         let cwd = FileManager.default.currentDirectoryPath
         #expect(absolutePath("bin/tool") == cwd + "/bin/tool")

@@ -234,6 +234,15 @@ public final class Daemon: @unchecked Sendable {
                 )
                 return BreakExceptionResult(available: available, enabled: enabled)
             },
+            register(RPC.breakFunction) { parameters in
+                let (snapshot, breakpoint) = try await manager.setFunctionBreakpoint(
+                    sessionId: parameters.sessionId,
+                    name: parameters.name,
+                    condition: parameters.condition,
+                    hitCondition: parameters.hitCondition
+                )
+                return BreakSetResult(snapshot: snapshot, breakpoint: breakpoint)
+            },
             register(RPC.continue) { p in
                 try await manager.continueExecution(sessionId: p.sessionId, wait: p.wait)
             },
@@ -291,6 +300,12 @@ public final class Daemon: @unchecked Sendable {
                     sessionId: p.sessionId, expression: p.expression, frameIndex: p.frame ?? 0
                 )
                 return ExprResult(value: r.value, type: r.type, variablesReference: r.variablesReference)
+            },
+            register(RPC.lldb) { parameters in
+                try await LLDBCommandResult(output: manager.runLLDBCommand(
+                    sessionId: parameters.sessionId,
+                    command: parameters.command
+                ))
             },
             register(RPC.stop) { p in
                 try await StopResult(ok: true, action: manager.stop(sessionId: p.sessionId, mode: p.mode))

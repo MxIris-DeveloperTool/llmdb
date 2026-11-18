@@ -71,6 +71,7 @@ enum RPC {
     static let breakList = RPCMethod<SessionParams, BreakListResult>("break.list")
     static let breakDelete = RPCMethod<BreakDeleteParams, BreakListResult>("break.delete")
     static let breakException = RPCMethod<BreakExceptionParams, BreakExceptionResult>("break.exception")
+    static let breakFunction = RPCMethod<BreakFunctionParams, BreakSetResult>("break.function")
     static let `continue` = RPCMethod<ExecParams, SessionSnapshot>("continue")
     static let runUntil = RPCMethod<RunUntilParams, BreakSetResult>("run-until")
     static let interrupt = RPCMethod<ExecParams, SessionSnapshot>("interrupt")
@@ -84,6 +85,8 @@ enum RPC {
     static let setVar = RPCMethod<SetVarParams, SetVarResult>("set-var")
     static let threads = RPCMethod<SessionParams, ThreadsResult>("threads")
     static let expr = RPCMethod<ExprParams, ExprResult>("expr")
+    /// Runs a raw lldb command; the result is what lldb printed.
+    static let lldb = RPCMethod<LLDBCommandParams, LLDBCommandResult>("lldb")
     static let stop = RPCMethod<StopParams, StopResult>("stop")
 }
 
@@ -246,6 +249,18 @@ struct BreakExceptionParams: Codable {
     let filters: [String]
 }
 
+struct BreakFunctionParams: Codable {
+    let sessionId: String?
+    let name: String
+    var condition: String?
+    var hitCondition: String?
+}
+
+struct LLDBCommandParams: Codable {
+    let sessionId: String?
+    let command: String
+}
+
 // MARK: - Results
 
 struct BreakSetResult: Codable {
@@ -285,6 +300,11 @@ struct ExprResult: Codable {
     let value: String
     let type: String?
     let variablesReference: Int
+}
+
+struct LLDBCommandResult: Codable {
+    /// What lldb printed, errors included.
+    let output: String
 }
 
 struct BreakExceptionResult: Codable {

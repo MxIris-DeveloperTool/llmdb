@@ -87,8 +87,24 @@ struct SetBreakpointsArgs: Encodable {
     let breakpoints: [BPLine]
 }
 
+/// Also the reply to `setFunctionBreakpoints`, which has the same shape.
 struct SetBreakpointsBody: Decodable {
     let breakpoints: [DAPBreakpointInfo]
+}
+
+/// One entry of a `setFunctionBreakpoints` request. lldb-dap resolves `name`
+/// with `breakpoint set --name`, so it accepts Swift, C, and full Objective-C
+/// selector names.
+struct FunctionBreakpointRequest: Encodable {
+    let name: String
+    /// Expression that must be true for the breakpoint to fire.
+    var condition: String?
+    /// lldb hit-count expression, e.g. ">5" or "3" — fires once the count matches.
+    var hitCondition: String?
+}
+
+struct SetFunctionBreakpointsArgs: Encodable {
+    let breakpoints: [FunctionBreakpointRequest]
 }
 
 struct DAPBreakpointInfo: Decodable {

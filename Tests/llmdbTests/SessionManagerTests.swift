@@ -443,6 +443,172 @@ struct SessionManagerIntegrationTests {
         #expect(await manager.list().isEmpty)
     }
 
+    @Test
+    func functionBreakpointStopsInNamedFunction() async throws {
+        let paths = try fixturePaths()
+        let manager = SessionManager()
+        let launch = try await manager.launch(binary: paths.fixtureBinary, args: ["quick"])
+        let sessionIdentifier = launch.sessionId
+
+        // A bare Swift name resolves by symbol — no file or line involved.
+        let (_, computeBreakpoint) = try await manager.setFunctionBreakpoint(
+            sessionId: sessionIdentifier,
+            name: "compute"
+        )
+        #expect(computeBreakpoint.verified == true)
+        #expect(computeBreakpoint.function == "compute")
+
+        let stopped = try await manager.continueExecution(sessionId: sessionIdentifier)
+        #expect(stopped.state == .stopped)
+        #expect(stopped.stopReason?.reason == "breakpoint")
+        #expect(stopped.stopReason?.hitBreakpointIDs == [computeBreakpoint.id])
+        let frames = try await manager.backtrace(sessionId: sessionIdentifier, depth: 1)
+        #expect(frames.first?.name.contains("compute") == true)
+
+        _ = try await manager.stop(sessionId: sessionIdentifier)
+    }
+
+    @Test
+    func functionBreakpointsFormOneSetBesideSourceBreakpoints() async throws {
+        let paths = try fixturePaths()
+        let manager = SessionManager()
+        let launch = try await manager.launch(binary: paths.fixtureBinary, args: ["quick"])
+        let sessionIdentifier = launch.sessionId
+
+        // BP3, the walkArray loop body — runs after compute() and fibonacci().
+        let (_, sourceBreakpoint) = try await manager.setBreakpoint(
+            sessionId: sessionIdentifier,
+            file: paths.fixtureSource,
+            line: 49
+        )
+        let (_, computeBreakpoint) = try await manager.setFunctionBreakpoint(
+            sessionId: sessionIdentifier,
+            name: "compute"
+        )
+        let (_, fibonacciBreakpoint) = try await manager.setFunctionBreakpoint(
+            sessionId: sessionIdentifier,
+            name: "fibonacci",
+            condition: "n == 8"
+        )
+        // setFunctionBreakpoints replaces the whole function set: adding the
+        // second must keep the first, and neither touches source breakpoints.
+        let allIdentifiers = Set([sourceBreakpoint.id, computeBreakpoint.id, fibonacciBreakpoint.id])
+        #expect(Set(try await manager.listBreakpoints(sessionId: sessionIdentifier).map(\.id)) == allIdentifiers)
+
+        // Setting a name again updates it in place instead of duplicating it.
+        let (_, updatedFibonacciBreakpoint) = try await manager.setFunctionBreakpoint(
+            sessionId: sessionIdentifier,
+            name: "fibonacci",
+            condition: "n == 7"
+        )
+        #expect(updatedFibonacciBreakpoint.id == fibonacciBreakpoint.id)
+        #expect(updatedFibonacciBreakpoint.condition == "n == 7")
+        #expect(try await manager.listBreakpoints(sessionId: sessionIdentifier).count == 3)
+
+        // They fire in program order, each with its own id.
+        let atCompute = try await manager.continueExecution(sessionId: sessionIdentifier)
+        #expect(atCompute.stopReason?.hitBreakpointIDs == [computeBreakpoint.id])
+        let atFibonacci = try await manager.continueExecution(sessionId: sessionIdentifier)
+        #expect(atFibonacci.stopReason?.hitBreakpointIDs == [fibonacciBreakpoint.id])
+        let argument = try await manager.evaluate(sessionId: sessionIdentifier, expression: "n")
+        #expect(argument.value == "7", "the updated condition should hold until n == 7")
+
+        // Deleting a function breakpoint resends the rest of the function set
+        // and leaves the source breakpoint alone, which then still fires.
+        let afterFirstDelete = try await manager.deleteBreakpoint(sessionId: sessionIdentifier, id: computeBreakpoint.id)
+        #expect(afterFirstDelete.map(\.id).sorted() == [sourceBreakpoint.id, fibonacciBreakpoint.id].sorted())
+        let afterSecondDelete = try await manager.deleteBreakpoint(
+            sessionId: sessionIdentifier,
+            id: fibonacciBreakpoint.id
+        )
+        #expect(afterSecondDelete.map(\.id) == [sourceBreakpoint.id])
+        let atLoop = try await manager.continueExecution(sessionId: sessionIdentifier)
+        #expect(atLoop.stopReason?.hitBreakpointIDs == [sourceBreakpoint.id])
+
+        _ = try await manager.stop(sessionId: sessionIdentifier)
+    }
+
+    @Test
+    func unresolvedFunctionBreakpointCarriesExplanation() async throws {
+        let paths = try fixturePaths()
+        let manager = SessionManager()
+        let launch = try await manager.launch(binary: paths.fixtureBinary, args: ["quick"])
+        let sessionIdentifier = launch.sessionId
+
+        let (_, breakpoint) = try await manager.setFunctionBreakpoint(
+            sessionId: sessionIdentifier,
+            name: "noSuchFunctionInTheFixture"
+        )
+        #expect(breakpoint.verified == false)
+        #expect(
+            breakpoint.message?.contains("no function matches") == true,
+            "expected the unresolved-function message, got: \(breakpoint.message ?? "nil")"
+        )
+        // A blank name is rejected before it reaches lldb.
+        await #expect(throws: LlmdbError.self) {
+            _ = try await manager.setFunctionBreakpoint(sessionId: sessionIdentifier, name: " ")
+        }
+
+        _ = try await manager.stop(sessionId: sessionIdentifier)
+    }
+
+    @Test
+    func lldbCommandReturnsWhatLLDBPrinted() async throws {
+        let paths = try fixturePaths()
+        let manager = SessionManager()
+        let launch = try await manager.launch(binary: paths.fixtureBinary, args: ["quick"])
+        let sessionIdentifier = launch.sessionId
+        // BP1: inside compute(), every local bound.
+        _ = try await manager.runUntil(sessionId: sessionIdentifier, file: paths.fixtureSource, line: 35)
+
+        let lookup = try await manager.runLLDBCommand(sessionId: sessionIdentifier, command: "image lookup -n compute")
+        #expect(lookup.contains("llmdb_fixture.compute"))
+
+        // Frame-relative commands act on lldb's selected frame: the top frame
+        // after a stop, until `frame select` moves it.
+        let total = try await manager.runLLDBCommand(sessionId: sessionIdentifier, command: "frame variable total")
+        #expect(total.contains("total = 20"))
+        _ = try await manager.runLLDBCommand(sessionId: sessionIdentifier, command: "frame select 1")
+        let callerFrame = try await manager.runLLDBCommand(sessionId: sessionIdentifier, command: "frame info")
+        #expect(callerFrame.contains("frame #1"))
+
+        // lldb-dap doesn't flag a failed command; lldb's error is the output.
+        let unknown = try await manager.runLLDBCommand(sessionId: sessionIdentifier, command: "notACommand")
+        #expect(unknown.contains("error"))
+
+        // Blank input would make lldb-dap repeat the previous command.
+        await #expect(throws: LlmdbError.self) {
+            _ = try await manager.runLLDBCommand(sessionId: sessionIdentifier, command: "  ")
+        }
+
+        _ = try await manager.stop(sessionId: sessionIdentifier)
+    }
+
+    @Test
+    func breakpointSetByLLDBCommandStopsTheTarget() async throws {
+        let paths = try fixturePaths()
+        let manager = SessionManager()
+        let launch = try await manager.launch(binary: paths.fixtureBinary, args: ["quick"])
+        let sessionIdentifier = launch.sessionId
+
+        // A regex breakpoint has no DAP equivalent; set through lldb, it isn't
+        // tracked, but `continue` still records the stop it causes.
+        let created = try await manager.runLLDBCommand(
+            sessionId: sessionIdentifier,
+            command: "breakpoint set -r ^walkArray"
+        )
+        #expect(created.contains("Breakpoint"))
+        #expect(try await manager.listBreakpoints(sessionId: sessionIdentifier).isEmpty)
+
+        let stopped = try await manager.continueExecution(sessionId: sessionIdentifier)
+        #expect(stopped.state == .stopped)
+        #expect(stopped.stopReason?.reason == "breakpoint")
+        let frames = try await manager.backtrace(sessionId: sessionIdentifier, depth: 1)
+        #expect(frames.first?.name.contains("walkArray") == true)
+
+        _ = try await manager.stop(sessionId: sessionIdentifier)
+    }
+
     /// Use `pgrep -P <parent>` to find a child PID by binary name.
     /// The PID from the fixture's "attach now with: llmdb attach --pid N"
     /// line, waiting up to 10s for it.

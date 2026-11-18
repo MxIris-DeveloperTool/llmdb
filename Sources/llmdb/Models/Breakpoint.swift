@@ -10,4 +10,7 @@ struct Breakpoint: Codable {
     var condition: String?
     /// The lldb hit-count expression gating the breakpoint, if any.
     var hitCondition: String?
+    /// The function name a function breakpoint was set on; nil for source
+    /// breakpoints.
+    var function: String?
 }

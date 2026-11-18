@@ -2,7 +2,7 @@
 
 > Debug any Mac or iOS Simulator app from your terminal or your AI agent.
 
-Wraps `lldb-dap` (Apple's Debug Adapter Protocol shim over LLDB) and gives AI agents a structured, session-oriented debugger. Launch a binary, set a breakpoint, step through code, inspect locals, evaluate expressions — all returning JSON, all driven by the same 22 verbs from the command line or over MCP.
+Wraps `lldb-dap` (Apple's Debug Adapter Protocol shim over LLDB) and gives AI agents a structured, session-oriented debugger. Launch a binary, set a breakpoint, step through code, inspect locals, evaluate expressions — all returning JSON, all driven by the same 24 verbs from the command line or over MCP.
 
 ## See it in action
 
@@ -178,6 +178,8 @@ llmdb sessions
 # Manage breakpoints
 llmdb break set ./Sources/Fixture/main.swift:34
 llmdb break set ./Sources/Fixture/main.swift:49 --condition "index == 2"
+llmdb break function compute          # by name — no file:line or debug info needed
+llmdb break function -- '-[NSWindow makeFirstResponder:]'   # `--` shields the leading `-`
 llmdb break exception                 # list available filters (swift_throw, …)
 llmdb break exception swift_throw     # stop when the target throws a Swift error
 llmdb break list
@@ -188,6 +190,11 @@ llmdb interrupt
 
 # Inspect threads
 llmdb threads
+
+# Anything else lldb can do, as a raw command
+llmdb lldb image lookup -n compute
+llmdb lldb disassemble --frame --count 8
+llmdb lldb "breakpoint set -r '^-\[NSTableView '"   # quote it whole when it has its own quotes
 ```
 
 ## Command reference
@@ -208,7 +215,8 @@ All commands return JSON. Pass `--session <id>` when more than one session is ac
 | Command | Description | Key options |
 |---|---|---|
 | `break set <file>:<line>` | Set a source breakpoint; returns the verified BP and a session snapshot. `<file>` can be absolute, relative, or a bare name (`main.swift`) — lldb matches it by path suffix | `--condition <expr>`, `--hit-condition <expr>` |
-| `break list` | List breakpoints in the session | — |
+| `break function <name>` | Set a breakpoint on every function matching a name: Swift (`compute`, `Module.Type.method`), C, or an Objective-C selector (`-[NSWindow makeFirstResponder:]`). Resolved by symbol, so system frameworks without debug info work. `verified: false` means nothing matches yet — a typo, or a module that hasn't loaded | `--condition <expr>`, `--hit-condition <expr>`; options go before the name, and a name starting with `-` needs `--` before it |
+| `break list` | List breakpoints in the session (source and function) | — |
 | `break delete <id>` | Remove a breakpoint by id; returns the survivors | — |
 | `break exception [filters…]` | Stop on thrown exceptions; pass adapter filter ids (e.g. `swift_throw`), or none to clear and list available | — |
 
@@ -236,6 +244,7 @@ All four blocking verbs accept `--wait <seconds|none>`. Default timeouts: `conti
 | `expr <expression>` | Evaluate in the context of a frame. Strings are returned in full (up to 1M chars); void calls succeed with `type: "void"`. In frames without debug info (e.g. right after attach), Foundation and UIKit/AppKit are imported automatically on the first ObjC compile error | `--frame N` |
 | `set-var <target> <value>` | Assign a new value to a variable (or lvalue like `self.x`) during a stop | `--frame N` |
 | `output` | Captured stdout/stderr/console output from the target | `--clear` (drain the buffer) |
+| `lldb <command>` | Run a raw lldb command and return its printed `output`, errors included — for what the other verbs don't cover: `image lookup`, `disassemble`, `memory read`, `register read`, regex breakpoints, `command script import`. Acts on lldb's selected frame (the top frame after a stop; `frame select N` moves it). Breakpoints set this way stop the target but aren't in `break list`. Resume and pause with `continue` / `step` / `interrupt`, not lldb's own commands, which return before the state change is recorded | Options go before the command; quote the command as one argument when it has quoted parts of its own |
 
 ### System
 

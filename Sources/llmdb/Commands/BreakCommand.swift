@@ -5,7 +5,7 @@ struct BreakCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "break",
         abstract: "Manage breakpoints",
-        subcommands: [SetSub.self, ListSub.self, DeleteSub.self, ExceptionSub.self]
+        subcommands: [SetSub.self, FunctionSub.self, ListSub.self, DeleteSub.self, ExceptionSub.self]
     )
 
     struct SetSub: AsyncParsableCommand {
@@ -34,6 +34,50 @@ struct BreakCommand: AsyncParsableCommand {
                     sessionId: session,
                     file: file,
                     line: line,
+                    condition: condition,
+                    hitCondition: hitCondition
+                )
+            )
+            try JSONOutput.print(result)
+        }
+    }
+
+    struct FunctionSub: AsyncParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "function",
+            abstract: "Set a breakpoint on a function by name (works without debug info)"
+        )
+
+        // Captured verbatim so an Objective-C instance method's leading `-`
+        // isn't read as an option; see `passthroughText`. Everything from the
+        // name on belongs to it, so llmdb's own options must come first.
+        @Argument(
+            parsing: .captureForPassthrough,
+            help: "Swift (`compute`, `Module.Type.method`), C, or Objective-C name. Put options first; precede a `-[…]` name with `--`, e.g. `-- '-[NSWindow makeFirstResponder:]'`."
+        )
+        var nameWords: [String] = []
+
+        @Option(name: .long, help: "Session ID")
+        var session: String?
+
+        @Option(name: .long, help: "Fire only when this expression is true, e.g. `n > 100`")
+        var condition: String?
+
+        @Option(name: .long, help: "Fire on a hit-count match, e.g. `>5` or `3`")
+        var hitCondition: String?
+
+        func validate() throws {
+            guard passthroughText(nameWords) != nil else {
+                throw ValidationError("Missing expected argument '<name>'")
+            }
+        }
+
+        func run() async throws {
+            let result = try await DaemonClient.call(
+                RPC.breakFunction,
+                BreakFunctionParams(
+                    sessionId: session,
+                    name: passthroughText(nameWords) ?? "",
                     condition: condition,
                     hitCondition: hitCondition
                 )
